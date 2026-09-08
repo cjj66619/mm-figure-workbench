@@ -513,10 +513,13 @@ def annotate_points(ax, xs: Sequence[float], ys: Sequence[float], labels: Sequen
     placed: list = [None] * len(labels)
     anchors = ax.transData.transform(np.column_stack([np.asarray(xs, float), np.asarray(ys, float)]))
     px_pt = fig.dpi / 72
+    pad = pad * px_pt   # pt → px，与像素包围盒同单位
     crowd = [int((np.hypot(*(anchors - a).T) < 30 * px_pt).sum()) for a in anchors]
     order = sorted(range(len(labels)), key=lambda i: -crowd[i])
     for i in order:
         (x, y), lab, c, anc = (xs[i], ys[i]), labels[i], colors[i], anchors[i]
+        others = np.asarray([a for a in pts if not (abs(a[0] - anc[0]) < 1e-6 and abs(a[1] - anc[1]) < 1e-6)])
+        peers = np.delete(anchors, i, axis=0)   # 其它待标注的点：标签不能离它们比离自己更近
         best, best_score = None, None
         ann = ax.annotate(lab, (x, y), xytext=offsets_pt[0], textcoords="offset points", fontsize=size,
                           color=c or "black", ha="center", va="center", **kw)
@@ -526,19 +529,20 @@ def annotate_points(ax, xs: Sequence[float], ys: Sequence[float], labels: Sequen
             ann.set_va("bottom" if dy > 0 else "top" if dy < 0 else "center")
             bb = ann.get_window_extent(renderer)
             out_of_axes = (bb.x0 < ax_bb.x0 or bb.x1 > ax_bb.x1 or bb.y0 < ax_bb.y0 or bb.y1 > ax_bb.y1)
-            others = [a for a in pts if not (abs(a[0] - anc[0]) < 1e-6 and abs(a[1] - anc[1]) < 1e-6)]
-            score = (2 if out_of_axes else 0) + (1 if _points_in(bb, np.asarray(others), pad) else 0) \
-                + (1 if _bbox_hits(bb, boxes, pad) else 0)
-            if score == 0:
-                best = (dx, dy)
-                break
+            hard = (4 if out_of_axes else 0) + (2 if _points_in(bb, others, pad) else 0) \
+                + (2 if _bbox_hits(bb, boxes, pad) else 0) \
+                + (2 if _label_ambiguous(bb, anc, peers, pad) else 0) \
+                + (1 if _segment_blocked(anc, bb, peers, boxes, pad) else 0)
+            score = hard + 1e-3 * (abs(dx) + abs(dy))   # 同为无冲突时取离点最近的偏移
             if best_score is None or score < best_score:
                 best, best_score = (dx, dy), score
+            if hard == 0:
+                break
         dx, dy = best
         ann.set_position((dx, dy))
         ann.set_ha("left" if dx > 0 else "right" if dx < 0 else "center")
         ann.set_va("bottom" if dy > 0 else "top" if dy < 0 else "center")
-        if best_score:
+        if best_score >= 1:
             print(f"[mm_plot_style] WARN annotate_points: 『{lab}』无完全无冲突位置", file=sys.stderr)
         if connector and (abs(dx) + abs(dy)) >= 12:
             ax.annotate("", (x, y), xytext=(dx * 0.75, dy * 0.75), textcoords="offset points",
@@ -546,6 +550,43 @@ def annotate_points(ax, xs: Sequence[float], ys: Sequence[float], labels: Sequen
         boxes.append(ann.get_window_extent(renderer))
         placed[i] = ann
     return placed
+
+
+def _label_ambiguous(bb, anchor, others, pad: float) -> bool:
+    """标签离别的数据点比离自己的点更近（会被读成别人的标签）。"""
+    import numpy as np
+    if others is None or len(others) == 0:
+        return False
+    cx, cy = (bb.x0 + bb.x1) / 2, (bb.y0 + bb.y1) / 2
+    d_own = np.hypot(cx - anchor[0], cy - anchor[1])
+    d_other = np.hypot(others[:, 0] - cx, others[:, 1] - cy).min()
+    return bool(d_other < d_own + pad)
+
+
+def _segment_blocked(anchor, bb, others, boxes, pad: float) -> bool:
+    """点到标签中心的连线穿过别的数据点或已有文字（引线会把读者引向别处）。"""
+    import numpy as np
+    cx, cy = (bb.x0 + bb.x1) / 2, (bb.y0 + bb.y1) / 2
+    ax0, ay0 = float(anchor[0]), float(anchor[1])
+    seg = np.array([cx - ax0, cy - ay0])
+    length = float(np.hypot(*seg))
+    if length < 1e-6:
+        return False
+    if others is not None and len(others) > 0:
+        rel = others - np.array([ax0, ay0])
+        t = np.clip(rel @ seg / length**2, 0.0, 1.0)
+        dist = np.hypot(*(rel - t[:, None] * seg).T)
+        if bool((dist < pad).any()):
+            return True
+    n = max(2, int(length / 2))
+    for k in np.linspace(0.0, 1.0, n):
+        px, py = ax0 + k * seg[0], ay0 + k * seg[1]
+        if bb.x0 <= px <= bb.x1 and bb.y0 <= py <= bb.y1:
+            break
+        for o in boxes:
+            if o.x0 - pad < px < o.x1 + pad and o.y0 - pad < py < o.y1 + pad:
+                return True
+    return False
 
 
 def annotate_heatmap(ax, im, fmt: str = "{:.2f}", *, fontsize: float | None = None, threshold: float = 0.55,
