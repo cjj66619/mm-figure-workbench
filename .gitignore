@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.smoke_tmp/
+figures/
+*.pdf
+*.png
+*.svg
